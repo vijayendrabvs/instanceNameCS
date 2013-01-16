@@ -1,0 +1,186 @@
+diff --git a/server/src/com/cloud/configuration/Config.java b/server/src/com/cloud/configuration/Config.java
+index b91fbdd..62f5cba 100755
+--- a/server/src/com/cloud/configuration/Config.java
++++ b/server/src/com/cloud/configuration/Config.java
+@@ -231,6 +231,7 @@ public enum Config {
+     EnableEC2API("Advanced", ManagementServer.class, Boolean.class, "enable.ec2.api", "false", "enable EC2 API on CloudStack", null),
+     EnableS3API("Advanced", ManagementServer.class, Boolean.class, "enable.s3.api", "false", "enable Amazon S3 API on CloudStack", null),
+     RecreateSystemVmEnabled("Advanced", ManagementServer.class, Boolean.class, "recreate.systemvm.enabled", "false", "If true, will recreate system vm root disk whenever starting system vm", "true,false"),
++    SetVmInternalNameUsingDisplayName("Advanced", ManagementServer.class, Boolean.class, "vm.instancename.flag", "false", "If true, will append guest VM's display Name (if set) to its internal name and set hostname and display name to the conjoined value", "true,false"),
+     IncorrectLoginAttemptsAllowed("Advanced", ManagementServer.class, Integer.class, "incorrect.login.attempts.allowed", "5", "Incorrect login attempts allowed before the user is disabled", null),
+     // Ovm
+     OvmPublicNetwork("Hidden", ManagementServer.class, String.class, "ovm.public.network.device", null, "Specify the public bridge on host for public network", null),
+diff --git a/server/src/com/cloud/vm/UserVmManagerImpl.java b/server/src/com/cloud/vm/UserVmManagerImpl.java
+index f3aca68..cebfa64 100755
+--- a/server/src/com/cloud/vm/UserVmManagerImpl.java
++++ b/server/src/com/cloud/vm/UserVmManagerImpl.java
+@@ -303,10 +303,13 @@ public class UserVmManagerImpl implements UserVmManager, UserVmService, Manager
+     protected String _name;
+     protected String _instance;
+     protected String _zone;
++    protected boolean _instanceNameFlag;
+ 
+     private ConfigurationDao _configDao;
+     private int _createprivatetemplatefromvolumewait;
+     private int _createprivatetemplatefromsnapshotwait;
++    private final int MAX_VM_NAME_LEN = 80;
++    
+     @Override
+     public UserVmVO getVirtualMachine(long vmId) {
+         return _vmDao.findById(vmId);
+@@ -1103,6 +1106,15 @@ public class UserVmManagerImpl implements UserVmManager, UserVmService, Manager
+ 
+         VirtualMachine.State.getStateMachine().registerListener(new UserVmStateListener(_usageEventDao, _networkDao, _nicDao));
+ 
++        value = _configDao.getValue(Config.SetVmInternalNameUsingDisplayName.key());
++        if(value == null) {
++            _instanceNameFlag = false;
++        }
++        else
++        {
++            _instanceNameFlag = Boolean.parseBoolean(value);
++        }
++        
+         s_logger.info("User VM Manager is configured.");
+ 
+         return true;
+@@ -2056,7 +2068,7 @@ public class UserVmManagerImpl implements UserVmManager, UserVmService, Manager
+             }
+         }
+ 
+-        return createVirtualMachine(zone, serviceOffering, template, hostName, displayName, owner, diskOfferingId,
++        return createVirtualMachine(zone, serviceOffering, template, hostName, displayName, _instanceNameFlag, owner, diskOfferingId,
+                 diskSize, networkList, securityGroupIdList, group, userData, sshKeyPair, hypervisor, caller, requestedIps, defaultIp, keyboard);
+     }
+ 
+@@ -2161,7 +2173,7 @@ public class UserVmManagerImpl implements UserVmManager, UserVmService, Manager
+             }
+         }
+ 
+-        return createVirtualMachine(zone, serviceOffering, template, hostName, displayName, owner, diskOfferingId,
++        return createVirtualMachine(zone, serviceOffering, template, hostName, displayName, _instanceNameFlag, owner, diskOfferingId,
+                 diskSize, networkList, securityGroupIdList, group, userData, sshKeyPair, hypervisor, caller, requestedIps, defaultIp, keyboard);
+     }
+ 
+@@ -2248,11 +2260,18 @@ public class UserVmManagerImpl implements UserVmManager, UserVmService, Manager
+             }
+         }
+ 
+-        return createVirtualMachine(zone, serviceOffering, template, hostName, displayName, owner, diskOfferingId, diskSize, networkList, null, group, userData, sshKeyPair, hypervisor, caller, requestedIps, defaultIp, keyboard);
++        return createVirtualMachine(zone, serviceOffering, template, hostName, displayName, _instanceNameFlag, owner, diskOfferingId, diskSize, networkList, null, group, userData, sshKeyPair, hypervisor, caller, requestedIps, defaultIp, keyboard);
++    }
++
++    public void checkNameForRFCCompliance(String name) {
++        if (!NetUtils.verifyDomainNameLabel(name, true)) {
++            throw new InvalidParameterValueException("Invalid name. Vm name can contain ASCII letters 'a' through 'z', the digits '0' through '9', "
++                    + "and the hyphen ('-'), must be between 1 and 63 characters long, and can't start or end with \"-\" and can't start with digit");
++        }
+     }
+ 
+     @DB @ActionEvent(eventType = EventTypes.EVENT_VM_CREATE, eventDescription = "deploying Vm", create = true)
+-    protected UserVm createVirtualMachine(DataCenter zone, ServiceOffering serviceOffering, VirtualMachineTemplate template, String hostName, String displayName, Account owner, Long diskOfferingId,
++    protected UserVm createVirtualMachine(DataCenter zone, ServiceOffering serviceOffering, VirtualMachineTemplate template, String hostName, String displayName, boolean nameFlag, Account owner, Long diskOfferingId,
+             Long diskSize, List<NetworkVO> networkList, List<Long> securityGroupIdList, String group, String userData, String sshKeyPair, HypervisorType hypervisor, Account caller, Map<Long, String> requestedIps, String defaultNetworkIp, String keyboard) throws InsufficientCapacityException, ResourceUnavailableException, ConcurrentOperationException, StorageUnavailableException, ResourceAllocationException {
+ 
+         _accountMgr.checkAccess(caller, null, true, owner);
+@@ -2434,7 +2453,23 @@ public class UserVmManagerImpl implements UserVmManager, UserVmService, Manager
+ 
+         long id = _vmDao.getNextInSequence(Long.class, "id");
+ 
+-        String instanceName = VirtualMachineName.getVmName(id, owner.getId(), _instance);
++        String instanceName;
++        if (nameFlag && displayName != null) {
++            // Search whether there is already an instance with the same instance name
++            // that is not in the destroyed or expunging state.
++            VMInstanceVO vm = _vmInstanceDao.findVMByInstanceName(displayName);
++            if (vm != null && vm.getState() != VirtualMachine.State.Expunging) {
++                throw new InvalidParameterValueException("There already exists a VM by the display name supplied");
++            }
++            // Check if the displayName conforms to RFC standards.
++            checkNameForRFCCompliance(displayName);
++            instanceName = VirtualMachineName.getVmName(id, owner.getId(), displayName);
++            if (instanceName.length() > MAX_VM_NAME_LEN) {
++                throw new InvalidParameterValueException("Specified display name " + displayName + " causes VM name to exceed 80 characters in length");
++            }
++        } else {
++            instanceName = VirtualMachineName.getVmName(id, owner.getId(), _instance);
++        }
+ 
+         String uuidName = UUID.randomUUID().toString();
+ 
+@@ -2442,11 +2477,8 @@ public class UserVmManagerImpl implements UserVmManager, UserVmService, Manager
+         if (hostName == null) {
+             hostName = uuidName;
+         } else {
+-            //1) check is hostName is RFC complient
+-            if (!NetUtils.verifyDomainNameLabel(hostName, true)) {
+-                throw new InvalidParameterValueException("Invalid name. Vm name can contain ASCII letters 'a' through 'z', the digits '0' through '9', "
+-                        + "and the hyphen ('-'), must be between 1 and 63 characters long, and can't start or end with \"-\" and can't start with digit");
+-            }
++            //1) check is hostName is RFC compliant
++        	checkNameForRFCCompliance(hostName);
+             //2) hostName has to be unique in the network domain
+             Map<String, List<Long>> ntwkDomains = new HashMap<String, List<Long>>();
+             for (NetworkVO network : networkList) {
+diff --git a/server/src/com/cloud/vm/dao/VMInstanceDao.java b/server/src/com/cloud/vm/dao/VMInstanceDao.java
+index 8b0a523..91f9c65 100644
+--- a/server/src/com/cloud/vm/dao/VMInstanceDao.java
++++ b/server/src/com/cloud/vm/dao/VMInstanceDao.java
+@@ -75,6 +75,8 @@ public interface VMInstanceDao extends GenericDao<VMInstanceVO, Long>, StateDao<
+     
+     VMInstanceVO findByIdTypes(long id, VirtualMachine.Type... types);
+     
++    VMInstanceVO findVMByInstanceName(String name);
++    
+     void updateProxyId(long id, Long proxyId, Date time);
+ 
+     List<VMInstanceVO> listByHostIdTypes(long hostid, VirtualMachine.Type... types);
+diff --git a/server/src/com/cloud/vm/dao/VMInstanceDaoImpl.java b/server/src/com/cloud/vm/dao/VMInstanceDaoImpl.java
+index 85ad5d0..fe157df 100644
+--- a/server/src/com/cloud/vm/dao/VMInstanceDaoImpl.java
++++ b/server/src/com/cloud/vm/dao/VMInstanceDaoImpl.java
+@@ -74,6 +74,7 @@ public class VMInstanceDaoImpl extends GenericDaoBase<VMInstanceVO, Long> implem
+     protected final SearchBuilder<VMInstanceVO> HostIdTypesSearch;
+     protected final SearchBuilder<VMInstanceVO> HostIdUpTypesSearch;
+     protected final SearchBuilder<VMInstanceVO> HostUpSearch;
++    protected final SearchBuilder<VMInstanceVO> InstanceNameSearch;
+     protected final GenericSearchBuilder<VMInstanceVO, Long> CountVirtualRoutersByAccount;
+     protected GenericSearchBuilder<VMInstanceVO, Long> CountRunningByHost;
+     protected GenericSearchBuilder<VMInstanceVO, Long> CountRunningByAccount;
+@@ -178,6 +179,10 @@ public class VMInstanceDaoImpl extends GenericDaoBase<VMInstanceVO, Long> implem
+         HostUpSearch.and("states", HostUpSearch.entity().getState(), Op.IN);
+         HostUpSearch.done();
+         
++        InstanceNameSearch = createSearchBuilder();
++        InstanceNameSearch.and("instanceName", InstanceNameSearch.entity().getInstanceName(), Op.EQ);
++        InstanceNameSearch.done();
++        
+         CountVirtualRoutersByAccount = createSearchBuilder(Long.class);
+         CountVirtualRoutersByAccount.select(null, Func.COUNT, null);
+         CountVirtualRoutersByAccount.and("account", CountVirtualRoutersByAccount.entity().getAccountId(), SearchCriteria.Op.EQ);
+@@ -330,6 +335,12 @@ public class VMInstanceDaoImpl extends GenericDaoBase<VMInstanceVO, Long> implem
+         return findOneIncludingRemovedBy(sc);
+     }
+ 
++    @Override
++    public VMInstanceVO findVMByInstanceName(String name) {
++        SearchCriteria<VMInstanceVO> sc = InstanceNameSearch.create();
++        sc.setParameters("instanceName", name);
++        return findOneBy(sc);
++    }
+    
+     @Override
+     public void updateProxyId(long id, Long proxyId, Date time) {
+diff --git a/setup/db/db/schema-40to410.sql b/setup/db/db/schema-40to410.sql
+index bf3fb30..32bc7ae 100644
+--- a/setup/db/db/schema-40to410.sql
++++ b/setup/db/db/schema-40to410.sql
+@@ -65,6 +65,8 @@ ALTER TABLE `cloud`.`external_load_balancer_devices` DROP COLUMN `is_inline`;
+ 
+ INSERT IGNORE INTO `cloud`.`configuration` VALUES ('Network','DEFAULT','NetworkManager','network.dhcp.nondefaultnetwork.setgateway.guestos','Windows','The guest OS\'s name start with this fields would result in DHCP server response gateway information even when the network it\'s on is not default network. Names are separated by comma.');
+ 
++INSERT IGNORE INTO `cloud`.`configuration` VALUES ('Advanced', 'DEFAULT', 'management-server', 'vm.hostname.flag', 'false', 'Set guest VM's display Name (if set) as its hostname');
++
+ ALTER TABLE `sync_queue` ADD `queue_size` SMALLINT NOT NULL DEFAULT '0' COMMENT 'number of items being processed by the queue';
+ 
+ ALTER TABLE `sync_queue` ADD `queue_size_limit` SMALLINT NOT NULL DEFAULT '1' COMMENT 'max number of items the queue can process concurrently';
